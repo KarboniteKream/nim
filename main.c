@@ -54,6 +54,8 @@ void restore_terminal() {
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.terminal) == -1) {
         die("tcsetattr");
     }
+
+    write(STDIN_FILENO, "\x1b[?1049l", 8);
 }
 
 void enable_raw_mode() {
@@ -74,6 +76,8 @@ void enable_raw_mode() {
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) {
         die("tcsetattr");
     }
+
+    write(STDIN_FILENO, "\x1b[?1049h", 8);
 }
 
 uint16_t read_key() {
@@ -206,7 +210,7 @@ void ab_free(struct abuf *ab) {
 
 void draw_rows(struct abuf *ab) {
     char welcome[80];
-    size_t len = snprintf(welcome, sizeof(welcome), "Nim -- version %s", VERSION);
+    size_t len = snprintf(welcome, sizeof(welcome), "Nim (%s)", VERSION);
 
     if (len > E.cols) {
         len = E.cols;
