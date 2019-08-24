@@ -1,3 +1,7 @@
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <ctype.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -6,18 +10,32 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
 
-#define VERSION "0.0.1"
+#define NIM_VERSION "0.0.1"
+#define NIM_TAB_STOP 4
+
 #define CTRL_KEY(k) ((k) & 0x1f)
 #define ABUF_INIT { NULL, 0 }
+
+struct erow {
+    char *chars;
+    size_t len;
+    char *render;
+    size_t rlen;
+};
 
 struct econfig {
     uint16_t x;
     uint16_t y;
-    uint16_t rows;
-    uint16_t cols;
+    uint16_t w;
+    uint16_t h;
+    struct erow *row;
+    size_t rows;
+    size_t rowoff;
+    size_t coloff;
     struct termios terminal;
 };
 
@@ -35,7 +53,7 @@ enum ekey {
 
 struct abuf {
     char *buf;
-    size_t len;
+    size_t size;
 };
 
 struct econfig E;
@@ -192,97 +210,224 @@ int8_t get_window_size(uint16_t *rows, uint16_t *cols) {
     return 0;
 }
 
-void ab_append(struct abuf *ab, const char *s, size_t len) {
-    char *new = realloc(ab->buf, ab->len + len);
+void update_row(struct erow *row) {
+    size_t idx = 0;
+    size_t tabs = 0;
+
+    for (size_t i = 0; i < row->len; i++) {
+        if (row->chars[i] == '\t') {
+            tabs++;
+        }
+    }
+
+    free(row->render);
+    row->render = malloc(row->len + (tabs * (NIM_TAB_STOP - 1)) + 1);
+
+    for (size_t i = 0; i < row->len; i++) {
+        if (row->chars[i] == '\t') {
+            row->render[idx++] = ' ';
+
+            while (idx % NIM_TAB_STOP != 0) {
+                row->render[idx++] = ' ';
+            }
+        } else {
+            row->render[idx++] = row->chars[i];
+        }
+    }
+
+    row->render[idx] = '\0';
+    row->rlen = idx;
+}
+
+void append_row(char *s, size_t len) {
+    E.row = realloc(E.row, (E.rows + 1) * sizeof(struct erow));
+
+    size_t at = E.rows;
+    E.row[at].len = len;
+    E.row[at].chars = malloc(len + 1);
+    memcpy(E.row[at].chars, s, len);
+    E.row[at].chars[len] = '\0';
+
+    E.row[at].render = NULL;
+    E.row[at].rlen = 0;
+    update_row(&E.row[at]);
+
+    E.rows++;
+}
+
+void open(char *filename) {
+    FILE *fp = fopen(filename, "r");
+
+    if (!fp) {
+        die("fopen");
+    }
+
+    char *line = NULL;
+    size_t size = 0;
+
+    while (true) {
+        ssize_t len = getline(&line, &size, fp);
+
+        if (len == -1) {
+            break;
+        }
+
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            len--;
+        }
+
+        append_row(line, len);
+    }
+
+    free(line);
+    fclose(fp);
+}
+
+void ab_append(struct abuf *ab, const char *s, size_t size) {
+    char *new = realloc(ab->buf, ab->size + size);
 
     if (new == NULL) {
         return;
     }
 
-    memcpy(&new[ab->len], s, len);
+    memcpy(&new[ab->size], s, size);
     ab->buf = new;
-    ab->len += len;
+    ab->size += size;
 }
 
 void ab_free(struct abuf *ab) {
     free(ab->buf);
 }
 
-void draw_rows(struct abuf *ab) {
-    char welcome[80];
-    size_t len = snprintf(welcome, sizeof(welcome), "Nim (%s)", VERSION);
-
-    if (len > E.cols) {
-        len = E.cols;
+void scroll_screen() {
+    if (E.y < E.rowoff) {
+        E.rowoff = E.y;
     }
 
-    for (uint16_t y = 0; y < E.rows; y++) {
-        if (y == E.rows / 3) {
-            size_t padding = (E.cols - len) / 2;
+    if (E.y >= E.rowoff + E.h) {
+        E.rowoff = E.y - E.h + 1;
+    }
 
-            if (padding > 0) {
+    if (E.x < E.coloff) {
+        E.coloff = E.x;
+    }
+
+    if (E.x >= E.coloff + E.w) {
+        E.coloff = E.x - E.w + 1;
+    }
+}
+
+void draw_lines(struct abuf *ab) {
+    char welcome[80];
+    size_t len = snprintf(welcome, sizeof(welcome), "Nim (%s)", NIM_VERSION);
+
+    if (len > E.w) {
+        len = E.w;
+    }
+
+    for (uint16_t y = 0; y < E.h; y++) {
+        size_t row = y + E.rowoff;
+
+        if (row >= E.rows) {
+            if (E.rows == 0 && y == E.h / 3) {
+                size_t padding = (E.w - len) / 2;
+
+                if (padding > 0) {
+                    ab_append(ab, "~", 1);
+                    padding--;
+                }
+
+                while (padding--) {
+                    ab_append(ab, " ", 1);
+                }
+
+                ab_append(ab, welcome, len);
+            } else {
                 ab_append(ab, "~", 1);
-                padding--;
             }
-
-            while (padding--) {
-                ab_append(ab, " ", 1);
-            }
-
-            ab_append(ab, welcome, len);
         } else {
-            ab_append(ab, "~", 1);
+            ssize_t len = E.row[row].rlen - E.coloff;
+
+            if (len < 0) {
+                len = 0;
+            } else if (len > E.w) {
+                len = E.w;
+            }
+
+            ab_append(ab, &E.row[row].render[E.coloff], len);
         }
 
         ab_append(ab, "\x1b[K", 3);
 
-        if (y < E.rows - 1) {
+        if (y < E.h - 1) {
             ab_append(ab, "\r\n", 2);
         }
     }
 }
 
 void refresh_screen() {
+    scroll_screen();
+
     struct abuf ab = ABUF_INIT;
 
     ab_append(&ab, "\x1b[?25l\x1b[H", 9);
-    draw_rows(&ab);
+    draw_lines(&ab);
 
     char buf[32];
-    size_t len = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.y + 1, E.x + 1);
-    ab_append(&ab, buf, len);
+    size_t num = snprintf(buf, sizeof(buf), "\x1b[%ld;%ldH",
+                          (E.y - E.rowoff) + 1, (E.x - E.coloff) + 1);
+    ab_append(&ab, buf, num);
 
     ab_append(&ab, "\x1b[?25h", 6);
 
-    write(STDOUT_FILENO, ab.buf, ab.len);
+    write(STDOUT_FILENO, ab.buf, ab.size);
     ab_free(&ab);
 }
 
 void move_cursor(uint16_t key) {
+    struct erow *row = (E.y < E.rows) ? &E.row[E.y] : NULL;
+
     switch (key) {
         case ARROW_UP:
             if (E.y > 0) {
                 E.y--;
             }
+
             break;
 
         case ARROW_DOWN:
-            if (E.y < E.rows - 1) {
+            if (E.y < E.rows) {
                 E.y++;
             }
+
             break;
 
         case ARROW_LEFT:
             if (E.x > 0) {
                 E.x--;
+            } else if (E.y > 0) {
+                E.y--;
+                E.x = E.row[E.y].len;
             }
+
             break;
 
         case ARROW_RIGHT:
-            if (E.x < E.cols - 1) {
+            if (row && E.x < row->len) {
                 E.x++;
+            } else if (row && E.x == row->len) {
+                E.y++;
+                E.x = 0;
             }
+
             break;
+    }
+
+    row = (E.y < E.rows) ? &E.row[E.y] : NULL;
+    size_t len = row ? row->len : 0;
+
+    if (E.x > len) {
+        E.x = len;
     }
 }
 
@@ -307,13 +452,14 @@ void process_key() {
             break;
 
         case END_KEY:
-            E.x = E.cols - 1;
+            E.x = E.w - 1;
             break;
 
         case PAGE_UP:
         case PAGE_DOWN:
+            // TODO: Simplify?
             {
-                int rows = E.rows;
+                int rows = E.h;
 
                 while (rows--) {
                     move_cursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
@@ -326,15 +472,23 @@ void process_key() {
 void init() {
     E.x = 0;
     E.y = 0;
+    E.row = NULL;
+    E.rows = 0;
+    E.rowoff = 0;
+    E.coloff = 0;
 
-    if (get_window_size(&E.rows, &E.cols) == -1) {
+    if (get_window_size(&E.h, &E.w) == -1) {
         die("get_size");
     }
 }
 
-int main() {
+int main(int argc, char **argv) {
     enable_raw_mode();
     init();
+
+    if (argc >= 2) {
+        open(argv[1]);
+    }
 
     while (true) {
         refresh_screen();
