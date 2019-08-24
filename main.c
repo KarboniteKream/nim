@@ -4,6 +4,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -17,10 +18,15 @@
 #include <unistd.h>
 
 #define NIM_VERSION "0.0.1"
+#define NIM_QUIT_TIMES 3
 #define NIM_TAB_STOP 4
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 #define ABUF_INIT { NULL, 0 }
+
+void set_message(const char *fmt, ...);
+void refresh_screen();
+char *prompt(char *message);
 
 struct erow {
     char *chars;
@@ -36,6 +42,7 @@ struct econfig {
     uint16_t w;
     uint16_t h;
     char *filename;
+    bool dirty;
     struct erow *rows;
     size_t lines;
     size_t rowoff;
@@ -46,13 +53,16 @@ struct econfig {
 };
 
 enum ekey {
+    ENTER = '\r',
+    ESCAPE = '\x1b',
+    BACKSPACE = 127,
     ARROW_UP = 1000,
     ARROW_DOWN,
     ARROW_LEFT,
     ARROW_RIGHT,
-    DEL_KEY,
-    HOME_KEY,
-    END_KEY,
+    DELETE,
+    HOME,
+    END,
     PAGE_UP,
     PAGE_DOWN,
 };
@@ -119,32 +129,32 @@ uint16_t read_key() {
         }
     }
 
-    if (c == '\x1b') {
+    if (c == ESCAPE) {
         char seq[3];
 
         if (read(STDIN_FILENO, &seq[0], 1) != 1) {
-            return '\x1b';
+            return ESCAPE;
         }
 
         if (read(STDIN_FILENO, &seq[1], 1) != 1) {
-            return '\x1b';
+            return ESCAPE;
         }
 
         if (seq[0] == '[') {
             if ('0' <= seq[1] && seq[1] <= '9') {
                 if (read(STDIN_FILENO, &seq[2], 1) != 1) {
-                    return '\x1b';
+                    return ESCAPE;
                 }
 
                 if (seq[2] == '~') {
                     switch (seq[1]) {
-                        case '1': return HOME_KEY;
-                        case '3': return DEL_KEY;
-                        case '4': return END_KEY;
+                        case '1': return HOME;
+                        case '3': return DELETE;
+                        case '4': return END;
                         case '5': return PAGE_UP;
                         case '6': return PAGE_DOWN;
-                        case '7': return HOME_KEY;
-                        case '8': return END_KEY;
+                        case '7': return HOME;
+                        case '8': return END;
                     }
                 }
             } else {
@@ -153,18 +163,18 @@ uint16_t read_key() {
                     case 'B': return ARROW_DOWN;
                     case 'C': return ARROW_RIGHT;
                     case 'D': return ARROW_LEFT;
-                    case 'H': return HOME_KEY;
-                    case 'F': return END_KEY;
+                    case 'H': return HOME;
+                    case 'F': return END;
                 }
             }
         } else if (seq[0] == 'O') {
             switch (seq[1]) {
-                case 'H': return HOME_KEY;
-                case 'F': return END_KEY;
+                case 'H': return HOME;
+                case 'F': return END;
             }
         }
 
-        return '\x1b';
+        return ESCAPE;
     }
 
     return c;
@@ -188,7 +198,7 @@ int8_t get_screen_position(uint16_t *row, uint16_t *col) {
 
     buf[i] = '\0';
 
-    if (buf[0] != '\x1b' || buf[1] != '[') {
+    if (buf[0] != ESCAPE || buf[1] != '[') {
         return -1;
     }
 
@@ -260,10 +270,14 @@ void update_row(struct erow *row) {
     row->rlen = idx;
 }
 
-void append_row(char *s, size_t len) {
-    E.rows = realloc(E.rows, (E.lines + 1) * sizeof(struct erow));
+void insert_row(size_t at, char *s, size_t len) {
+    if (at > E.lines) {
+        return;
+    }
 
-    size_t at = E.lines;
+    E.rows = realloc(E.rows, (E.lines + 1) * sizeof(struct erow));
+    memmove(&E.rows[at + 1], &E.rows[at], (E.lines - at) * sizeof(struct erow));
+
     E.rows[at].len = len;
     E.rows[at].chars = malloc(len + 1);
     memcpy(E.rows[at].chars, s, len);
@@ -274,9 +288,105 @@ void append_row(char *s, size_t len) {
     update_row(&E.rows[at]);
 
     E.lines++;
+    E.dirty = true;
 }
 
-void open(char *filename) {
+void free_row(struct erow *row) {
+    free(row->render);
+    free(row->chars);
+}
+
+void delete_row(size_t at) {
+    if (at >= E.lines) {
+        return;
+    }
+
+    free_row(&E.rows[at]);
+    memmove(&E.rows[at], &E.rows[at + 1], (E.lines - at - 1) * sizeof(struct erow));
+    E.lines--;
+    E.dirty = true;
+}
+
+void insert_char_at_row(struct erow *row, size_t at, uint16_t c) {
+    if (at > row->len) {
+        at = row->len;
+    }
+
+    row->chars = realloc(row->chars, row->len + 2);
+    memmove(&row->chars[at + 1], &row->chars[at], row->len - at + 1);
+    row->chars[at] = c;
+    row->len++;
+
+    update_row(row);
+    E.dirty = true;
+}
+
+void delete_char_at_row(struct erow *row, size_t at) {
+    if (at >= row->len) {
+        return;
+    }
+
+    memmove(&row->chars[at], &row->chars[at + 1], row->len - at);
+    row->len--;
+
+    update_row(row);
+    E.dirty = true;
+}
+
+void append_string_at_row(struct erow *row, char *s, size_t len) {
+    row->chars = realloc(row->chars, row->len + len + 1);
+    memcpy(&row->chars[row->len], s, len);
+    row->len += len;
+    row->chars[row->len] = '\0';
+    update_row(row);
+    E.dirty = true;
+}
+
+void insert_char(uint16_t c) {
+    if (E.y == E.lines) {
+        insert_row(E.lines, "", 0);
+    }
+
+    insert_char_at_row(&E.rows[E.y], E.x, c);
+    E.x++;
+}
+
+void insert_newline() {
+    if (E.x == 0) {
+        insert_row(E.y, "", 0);
+    } else {
+        struct erow *row = &E.rows[E.y];
+        insert_row(E.y + 1, &row->chars[E.x], row->len - E.x);
+
+        row = &E.rows[E.y];
+        row->len = E.x;
+        row->chars[row->len] = '\0';
+        update_row(row);
+    }
+
+    E.y++;
+    E.x = 0;
+}
+
+void delete_char() {
+    if ((E.x == 0 && E.y == 0) || E.y == E.lines) {
+        return;
+    }
+
+    struct erow *row = &E.rows[E.y];
+
+    if (E.x > 0) {
+        delete_char_at_row(row, E.x - 1);
+        E.x--;
+    } else {
+        E.x = E.rows[E.y - 1].len;
+        append_string_at_row(&E.rows[E.y - 1], row->chars, row->len);
+        delete_row(E.y);
+        E.y--;
+    }
+}
+
+void open_file(char *filename) {
     free(E.filename);
     E.filename = strdup(filename);
 
@@ -300,11 +410,65 @@ void open(char *filename) {
             len--;
         }
 
-        append_row(line, len);
+        insert_row(E.lines, line, len);
     }
 
     free(line);
     fclose(fp);
+    E.dirty = false;
+}
+
+char *to_string(size_t *len) {
+    *len = 0;
+
+    for (size_t i = 0; i < E.lines; i++) {
+        *len += E.rows[i].len + 1;
+    }
+
+    char *buf = malloc(*len);
+    char *ptr = buf;
+
+    for (size_t i = 0; i < E.lines; i++) {
+        memcpy(ptr, E.rows[i].chars, E.rows[i].len);
+        ptr += E.rows[i].len;
+        *ptr = '\n';
+        ptr++;
+    }
+
+    return buf;
+}
+
+void save_file() {
+    if (E.filename == NULL) {
+        E.filename = prompt("Save as: %s (ESC to cancel)");
+
+        if (E.filename == NULL) {
+            set_message("");
+            return;
+        }
+    }
+
+    size_t len;
+    char *buf = to_string(&len);
+
+    int32_t fd = open(E.filename, O_RDWR | O_CREAT, 0644);
+
+    if (fd != -1) {
+        if (ftruncate(fd, len) != -1) {
+            if (write(fd, buf, len) == (ssize_t) len) {
+                close(fd);
+                free(buf);
+                E.dirty = false;
+                set_message("%d bytes written to disk.", len);
+                return;
+            }
+        }
+
+        close(fd);
+    }
+
+    free(buf);
+    set_message("Save failed: %s", strerror(errno));
 }
 
 void ab_append(struct abuf *ab, const char *s, size_t size) {
@@ -397,8 +561,9 @@ void draw_status_bar(struct abuf *ab) {
     char status[80];
     char meta[80];
 
-    size_t len = snprintf(status, sizeof(status), "%.20s - %ld lines",
-            E.filename ? E.filename : "[No Name]", E.lines);
+    size_t len = snprintf(status, sizeof(status), "%.20s - %ld lines%s",
+            E.filename ? E.filename : "[No Name]", E.lines,
+            E.dirty ? " (modified)" : "");
     size_t mlen = snprintf(meta, sizeof(meta), "%ld/%ld", E.y + 1, E.lines);
 
     if (len > E.w) {
@@ -465,6 +630,42 @@ void set_message(const char *fmt, ...) {
     E.timestamp = time(NULL);
 }
 
+char *prompt(char *message) {
+    size_t size = 128;
+    size_t len = 0;
+    char *buf = calloc(size, sizeof(char));
+
+    while (true) {
+        set_message(message, buf);
+        refresh_screen();
+
+        uint16_t key = read_key();
+
+        if (key == ESCAPE) {
+            set_message("");
+            free(buf);
+            return NULL;
+        } else if (key == BACKSPACE || key == CTRL_KEY('h') || key == DELETE) {
+            if (len != 0) {
+                buf[--len] = '\0';
+            }
+        } else if (key == ENTER) {
+            if (len != 0) {
+                set_message("");
+                return buf;
+            }
+        } else if (!iscntrl(key) && key < 128) {
+            if (len == size - 1) {
+                size *= 2;
+                buf = realloc(buf, size);
+            }
+
+            buf[len++] = key;
+            buf[len] = '\0';
+        }
+    }
+}
+
 void move_cursor(uint16_t key) {
     struct erow *row = (E.y < E.lines) ? &E.rows[E.y] : NULL;
 
@@ -513,12 +714,38 @@ void move_cursor(uint16_t key) {
 }
 
 void process_key() {
+    static uint8_t quit_times = NIM_QUIT_TIMES;
     uint16_t c = read_key();
 
     switch (c) {
+        case ENTER:
+            insert_newline();
+            break;
+
+        case BACKSPACE:
+        case CTRL_KEY('h'):
+        case DELETE:
+            if (c == DELETE) {
+                move_cursor(ARROW_RIGHT);
+            }
+
+            delete_char();
+            break;
+
         case CTRL_KEY('q'):
+            if (E.dirty && quit_times > 0) {
+                set_message("WARNING! File has unsaved changes (%d more time%s...)",
+                        quit_times, quit_times > 1 ? "s" : "");
+                quit_times--;
+                return;
+            }
+
             clear_screen();
             exit(0);
+            break;
+
+        case CTRL_KEY('s'):
+            save_file();
             break;
 
         case ARROW_UP:
@@ -528,11 +755,11 @@ void process_key() {
             move_cursor(c);
             break;
 
-        case HOME_KEY:
+        case HOME:
             E.x = 0;
             break;
 
-        case END_KEY:
+        case END:
             if (E.y < E.lines) {
                 E.x = E.rows[E.y].len;
             }
@@ -558,7 +785,17 @@ void process_key() {
             }
 
             break;
+
+        case CTRL_KEY('l'):
+        case ESCAPE:
+            break;
+
+        default:
+            insert_char(c);
+            break;
     }
+
+    quit_times = NIM_QUIT_TIMES;
 }
 
 void init() {
@@ -566,6 +803,7 @@ void init() {
     E.y = 0;
     E.rx = 0;
     E.filename = NULL;
+    E.dirty = false;
     E.rows = NULL;
     E.lines = 0;
     E.rowoff = 0;
@@ -585,10 +823,10 @@ int main(int argc, char **argv) {
     init();
 
     if (argc >= 2) {
-        open(argv[1]);
+        open_file(argv[1]);
     }
 
-    set_message("HELP: Ctrl-Q = quit");
+    set_message("HELP: Ctrl-S = save | Ctrl-Q = quit");
 
     while (true) {
         refresh_screen();
