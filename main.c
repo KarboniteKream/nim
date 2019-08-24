@@ -28,8 +28,9 @@ struct erow {
 };
 
 struct econfig {
-    uint16_t x;
-    uint16_t y;
+    size_t x;
+    size_t y;
+    size_t rx;
     uint16_t w;
     uint16_t h;
     struct erow *row;
@@ -164,7 +165,7 @@ uint16_t read_key() {
     return c;
 }
 
-int8_t get_position(uint16_t *row, uint16_t *col) {
+int8_t get_screen_position(uint16_t *row, uint16_t *col) {
     if (write(STDOUT_FILENO, "\x1b[6n", 4) != 4) {
         return -1;
     }
@@ -193,7 +194,7 @@ int8_t get_position(uint16_t *row, uint16_t *col) {
     return 0;
 }
 
-int8_t get_window_size(uint16_t *rows, uint16_t *cols) {
+int8_t get_screen_size(uint16_t *rows, uint16_t *cols) {
     struct winsize ws;
 
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
@@ -201,13 +202,28 @@ int8_t get_window_size(uint16_t *rows, uint16_t *cols) {
             return -1;
         }
 
-        return get_position(rows, cols);
+        return get_screen_position(rows, cols);
     }
 
     *rows = ws.ws_row;
     *cols = ws.ws_col;
 
     return 0;
+}
+
+size_t x_to_rx(struct erow *row, size_t x) {
+    size_t rx = 0;
+
+    for (size_t i = 0; i < x; i++) {
+        if (row->chars[i] == '\t') {
+            // A tab is every NIM_TAB_STOP columns.
+            rx += (NIM_TAB_STOP - 1) - (rx % NIM_TAB_STOP);
+        }
+
+        rx++;
+    }
+
+    return rx;
 }
 
 void update_row(struct erow *row) {
@@ -300,6 +316,12 @@ void ab_free(struct abuf *ab) {
 }
 
 void scroll_screen() {
+    E.rx = 0;
+
+    if (E.y < E.rows) {
+        E.rx = x_to_rx(&E.row[E.y], E.x);
+    }
+
     if (E.y < E.rowoff) {
         E.rowoff = E.y;
     }
@@ -308,12 +330,12 @@ void scroll_screen() {
         E.rowoff = E.y - E.h + 1;
     }
 
-    if (E.x < E.coloff) {
-        E.coloff = E.x;
+    if (E.rx < E.coloff) {
+        E.coloff = E.rx;
     }
 
-    if (E.x >= E.coloff + E.w) {
-        E.coloff = E.x - E.w + 1;
+    if (E.rx >= E.coloff + E.w) {
+        E.coloff = E.rx - E.w + 1;
     }
 }
 
@@ -375,7 +397,7 @@ void refresh_screen() {
 
     char buf[32];
     size_t num = snprintf(buf, sizeof(buf), "\x1b[%ld;%ldH",
-                          (E.y - E.rowoff) + 1, (E.x - E.coloff) + 1);
+                          (E.y - E.rowoff) + 1, (E.rx - E.coloff) + 1);
     ab_append(&ab, buf, num);
 
     ab_append(&ab, "\x1b[?25h", 6);
@@ -452,19 +474,30 @@ void process_key() {
             break;
 
         case END_KEY:
-            E.x = E.w - 1;
+            if (E.y < E.rows) {
+                E.x = E.row[E.y].len;
+            }
             break;
 
         case PAGE_UP:
         case PAGE_DOWN:
-            // TODO: Simplify?
             {
-                int rows = E.h;
+                if (c == PAGE_UP) {
+                    E.y = E.rowoff;
+                } else if (c == PAGE_DOWN) {
+                    E.y = E.rowoff + E.h - 1;
 
+                    if (E.y > E.rows) {
+                        E.y = E.rows;
+                    }
+                }
+
+                int rows = E.h;
                 while (rows--) {
                     move_cursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
                 }
             }
+
             break;
     }
 }
@@ -472,12 +505,13 @@ void process_key() {
 void init() {
     E.x = 0;
     E.y = 0;
+    E.rx = 0;
     E.row = NULL;
     E.rows = 0;
     E.rowoff = 0;
     E.coloff = 0;
 
-    if (get_window_size(&E.h, &E.w) == -1) {
+    if (get_screen_size(&E.h, &E.w) == -1) {
         die("get_size");
     }
 }
