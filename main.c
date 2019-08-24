@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,7 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #define NIM_VERSION "0.0.1"
@@ -33,10 +35,13 @@ struct econfig {
     size_t rx;
     uint16_t w;
     uint16_t h;
-    struct erow *row;
-    size_t rows;
+    char *filename;
+    struct erow *rows;
+    size_t lines;
     size_t rowoff;
     size_t coloff;
+    char message[80];
+    time_t timestamp;
     struct termios terminal;
 };
 
@@ -256,22 +261,25 @@ void update_row(struct erow *row) {
 }
 
 void append_row(char *s, size_t len) {
-    E.row = realloc(E.row, (E.rows + 1) * sizeof(struct erow));
+    E.rows = realloc(E.rows, (E.lines + 1) * sizeof(struct erow));
 
-    size_t at = E.rows;
-    E.row[at].len = len;
-    E.row[at].chars = malloc(len + 1);
-    memcpy(E.row[at].chars, s, len);
-    E.row[at].chars[len] = '\0';
+    size_t at = E.lines;
+    E.rows[at].len = len;
+    E.rows[at].chars = malloc(len + 1);
+    memcpy(E.rows[at].chars, s, len);
+    E.rows[at].chars[len] = '\0';
 
-    E.row[at].render = NULL;
-    E.row[at].rlen = 0;
-    update_row(&E.row[at]);
+    E.rows[at].render = NULL;
+    E.rows[at].rlen = 0;
+    update_row(&E.rows[at]);
 
-    E.rows++;
+    E.lines++;
 }
 
 void open(char *filename) {
+    free(E.filename);
+    E.filename = strdup(filename);
+
     FILE *fp = fopen(filename, "r");
 
     if (!fp) {
@@ -318,8 +326,8 @@ void ab_free(struct abuf *ab) {
 void scroll_screen() {
     E.rx = 0;
 
-    if (E.y < E.rows) {
-        E.rx = x_to_rx(&E.row[E.y], E.x);
+    if (E.y < E.lines) {
+        E.rx = x_to_rx(&E.rows[E.y], E.x);
     }
 
     if (E.y < E.rowoff) {
@@ -350,8 +358,8 @@ void draw_lines(struct abuf *ab) {
     for (uint16_t y = 0; y < E.h; y++) {
         size_t row = y + E.rowoff;
 
-        if (row >= E.rows) {
-            if (E.rows == 0 && y == E.h / 3) {
+        if (row >= E.lines) {
+            if (E.lines == 0 && y == E.h / 3) {
                 size_t padding = (E.w - len) / 2;
 
                 if (padding > 0) {
@@ -368,7 +376,7 @@ void draw_lines(struct abuf *ab) {
                 ab_append(ab, "~", 1);
             }
         } else {
-            ssize_t len = E.row[row].rlen - E.coloff;
+            ssize_t len = E.rows[row].rlen - E.coloff;
 
             if (len < 0) {
                 len = 0;
@@ -376,14 +384,53 @@ void draw_lines(struct abuf *ab) {
                 len = E.w;
             }
 
-            ab_append(ab, &E.row[row].render[E.coloff], len);
+            ab_append(ab, &E.rows[row].render[E.coloff], len);
         }
 
-        ab_append(ab, "\x1b[K", 3);
+        ab_append(ab, "\x1b[K\r\n", 5);
+    }
+}
 
-        if (y < E.h - 1) {
-            ab_append(ab, "\r\n", 2);
+void draw_status_bar(struct abuf *ab) {
+    ab_append(ab, "\x1b[7m", 4);
+
+    char status[80];
+    char meta[80];
+
+    size_t len = snprintf(status, sizeof(status), "%.20s - %ld lines",
+            E.filename ? E.filename : "[No Name]", E.lines);
+    size_t mlen = snprintf(meta, sizeof(meta), "%ld/%ld", E.y + 1, E.lines);
+
+    if (len > E.w) {
+        len = E.w;
+    }
+
+    ab_append(ab, status, len);
+
+    while (len < E.w) {
+        if (E.w - len == mlen) {
+            ab_append(ab, meta, mlen);
+            break;
         }
+
+        ab_append(ab, " ", 1);
+        len++;
+    }
+
+    ab_append(ab, "\x1b[m\r\n", 5);
+}
+
+void draw_message_bar(struct abuf *ab) {
+    ab_append(ab, "\x1b[K", 3);
+
+    size_t len = strlen(E.message);
+
+    if (len > E.w) {
+        len = E.w;
+    }
+
+    if (len && time(NULL) - E.timestamp < 5) {
+        ab_append(ab, E.message, len);
     }
 }
 
@@ -391,13 +438,15 @@ void refresh_screen() {
     scroll_screen();
 
     struct abuf ab = ABUF_INIT;
-
     ab_append(&ab, "\x1b[?25l\x1b[H", 9);
+
     draw_lines(&ab);
+    draw_status_bar(&ab);
+    draw_message_bar(&ab);
 
     char buf[32];
     size_t num = snprintf(buf, sizeof(buf), "\x1b[%ld;%ldH",
-                          (E.y - E.rowoff) + 1, (E.rx - E.coloff) + 1);
+            (E.y - E.rowoff) + 1, (E.rx - E.coloff) + 1);
     ab_append(&ab, buf, num);
 
     ab_append(&ab, "\x1b[?25h", 6);
@@ -406,8 +455,18 @@ void refresh_screen() {
     ab_free(&ab);
 }
 
+void set_message(const char *fmt, ...) {
+    va_list args;
+
+    va_start(args, fmt);
+    vsnprintf(E.message, sizeof(E.message), fmt, args);
+    va_end(args);
+
+    E.timestamp = time(NULL);
+}
+
 void move_cursor(uint16_t key) {
-    struct erow *row = (E.y < E.rows) ? &E.row[E.y] : NULL;
+    struct erow *row = (E.y < E.lines) ? &E.rows[E.y] : NULL;
 
     switch (key) {
         case ARROW_UP:
@@ -418,7 +477,7 @@ void move_cursor(uint16_t key) {
             break;
 
         case ARROW_DOWN:
-            if (E.y < E.rows) {
+            if (E.y < E.lines) {
                 E.y++;
             }
 
@@ -429,7 +488,7 @@ void move_cursor(uint16_t key) {
                 E.x--;
             } else if (E.y > 0) {
                 E.y--;
-                E.x = E.row[E.y].len;
+                E.x = E.rows[E.y].len;
             }
 
             break;
@@ -445,7 +504,7 @@ void move_cursor(uint16_t key) {
             break;
     }
 
-    row = (E.y < E.rows) ? &E.row[E.y] : NULL;
+    row = (E.y < E.lines) ? &E.rows[E.y] : NULL;
     size_t len = row ? row->len : 0;
 
     if (E.x > len) {
@@ -474,8 +533,8 @@ void process_key() {
             break;
 
         case END_KEY:
-            if (E.y < E.rows) {
-                E.x = E.row[E.y].len;
+            if (E.y < E.lines) {
+                E.x = E.rows[E.y].len;
             }
             break;
 
@@ -487,8 +546,8 @@ void process_key() {
                 } else if (c == PAGE_DOWN) {
                     E.y = E.rowoff + E.h - 1;
 
-                    if (E.y > E.rows) {
-                        E.y = E.rows;
+                    if (E.y > E.lines) {
+                        E.y = E.lines;
                     }
                 }
 
@@ -506,14 +565,19 @@ void init() {
     E.x = 0;
     E.y = 0;
     E.rx = 0;
-    E.row = NULL;
-    E.rows = 0;
+    E.filename = NULL;
+    E.rows = NULL;
+    E.lines = 0;
     E.rowoff = 0;
     E.coloff = 0;
+    E.message[0] = '\0';
+    E.timestamp = 0;
 
     if (get_screen_size(&E.h, &E.w) == -1) {
         die("get_size");
     }
+
+    E.h -= 2;
 }
 
 int main(int argc, char **argv) {
@@ -523,6 +587,8 @@ int main(int argc, char **argv) {
     if (argc >= 2) {
         open(argv[1]);
     }
+
+    set_message("HELP: Ctrl-Q = quit");
 
     while (true) {
         refresh_screen();
