@@ -26,7 +26,7 @@
 
 void set_message(const char *fmt, ...);
 void refresh_screen();
-char *prompt(char *message);
+char *prompt(char *message, void (*callback)(char *, uint16_t));
 
 struct erow {
     char *chars;
@@ -241,6 +241,25 @@ size_t x_to_rx(struct erow *row, size_t x) {
     return rx;
 }
 
+size_t rx_to_x(struct erow *row, size_t rx) {
+    size_t curr_rx = 0;
+    size_t x;
+
+    for (x = 0; x < row->len; x++) {
+        if (row->chars[x] == '\t') {
+            curr_rx += (NIM_TAB_STOP - 1) - (curr_rx % NIM_TAB_STOP);
+        }
+
+        curr_rx++;
+
+        if (curr_rx > rx) {
+            return x;
+        }
+    }
+
+    return x;
+}
+
 void update_row(struct erow *row) {
     size_t idx = 0;
     size_t tabs = 0;
@@ -440,7 +459,7 @@ char *to_string(size_t *len) {
 
 void save_file() {
     if (E.filename == NULL) {
-        E.filename = prompt("Save as: %s (ESC to cancel)");
+        E.filename = prompt("Save as: %s (ESC to cancel)", NULL);
 
         if (E.filename == NULL) {
             set_message("");
@@ -469,6 +488,71 @@ void save_file() {
 
     free(buf);
     set_message("Save failed: %s", strerror(errno));
+}
+
+void find(char *query, uint16_t key) {
+    static ssize_t last_match = -1;
+    static int8_t direction = 1;
+
+    if (key == ENTER || key == ESCAPE) {
+        last_match = -1;
+        direction = 1;
+        return;
+    }
+
+    if (key == ARROW_DOWN || key == ARROW_RIGHT) {
+        direction = 1;
+    } else if (key == ARROW_UP || key == ARROW_LEFT) {
+        direction = -1;
+    } else {
+        last_match = -1;
+        direction = 1;
+    }
+
+    if (last_match == -1) {
+        direction = 1;
+    }
+
+    ssize_t y = last_match;
+
+    for (size_t i = 0; i < E.lines; i++) {
+        y += direction;
+
+        if (y == -1) {
+            y = E.lines - 1;
+        } else if (y == (ssize_t) E.lines) {
+            y = 0;
+        }
+
+        struct erow *row = &E.rows[y];
+        char *match = strstr(row->render, query);
+
+        if (match) {
+            last_match = y;
+            E.y = y;
+            E.x = rx_to_x(row, match - row->render);
+            E.rowoff = E.lines;
+            break;
+        }
+    }
+}
+
+void start_find() {
+    size_t x = E.x;
+    size_t y = E.y;
+    size_t rowoff = E.rowoff;
+    size_t coloff = E.coloff;
+
+    char *query = prompt("Find: %s (ESC to cancel, arrows to navigate)", find);
+
+    if (query == NULL) {
+        E.x = x;
+        E.y = y;
+        E.rowoff = rowoff;
+        E.coloff = coloff;
+    }
+
+    free(query);
 }
 
 void ab_append(struct abuf *ab, const char *s, size_t size) {
@@ -630,7 +714,7 @@ void set_message(const char *fmt, ...) {
     E.timestamp = time(NULL);
 }
 
-char *prompt(char *message) {
+char *prompt(char *message, void (*callback)(char *, uint16_t)) {
     size_t size = 128;
     size_t len = 0;
     char *buf = calloc(size, sizeof(char));
@@ -643,6 +727,11 @@ char *prompt(char *message) {
 
         if (key == ESCAPE) {
             set_message("");
+
+            if (callback) {
+                callback(buf, key);
+            }
+
             free(buf);
             return NULL;
         } else if (key == BACKSPACE || key == CTRL_KEY('h') || key == DELETE) {
@@ -652,6 +741,11 @@ char *prompt(char *message) {
         } else if (key == ENTER) {
             if (len != 0) {
                 set_message("");
+
+                if (callback) {
+                    callback(buf, key);
+                }
+
                 return buf;
             }
         } else if (!iscntrl(key) && key < 128) {
@@ -662,6 +756,10 @@ char *prompt(char *message) {
 
             buf[len++] = key;
             buf[len] = '\0';
+        }
+
+        if (callback) {
+            callback(buf, key);
         }
     }
 }
@@ -748,6 +846,10 @@ void process_key() {
             save_file();
             break;
 
+        case CTRL_KEY('f'):
+            start_find();
+            break;
+
         case ARROW_UP:
         case ARROW_DOWN:
         case ARROW_LEFT:
@@ -826,7 +928,7 @@ int main(int argc, char **argv) {
         open_file(argv[1]);
     }
 
-    set_message("HELP: Ctrl-S = save | Ctrl-Q = quit");
+    set_message("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
 
     while (true) {
         refresh_screen();
