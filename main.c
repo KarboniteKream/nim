@@ -908,7 +908,7 @@ void draw_gutter(struct abuf *ab, struct erow *row) {
     char gutter[E.gw + 1];
 
     if (row && NIM_NUMLINES) {
-        snprintf(gutter, sizeof(gutter), "%*ld", E.gw - 1, row->idx + 1);
+        snprintf(gutter, sizeof(gutter), "%*ld ", E.gw - 1, row->idx + 1);
     }
 
     ab_append(ab, "\x1b[90m", 5);
