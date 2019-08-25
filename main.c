@@ -118,7 +118,8 @@ char *C_keywords[] = {
     "#while", "#for", "#case", "#int", "#long", "#double", "#float", "#char",
     "#unsigned", "#signed", "#void", "#int8_t", "#uint8_t", "#int16_t", "#uint16_t",
     "#int32_t", "#uint32_t", "#int64_t", "#uint64_t", "#ssize_t", "#size_t",
-    "$NULL",
+    "#NULL", "#const", "#bool", "#true", "#false",
+    "$sizeof",
     NULL,
 };
 
@@ -451,7 +452,7 @@ uint8_t syntax_to_color(uint8_t hl) {
         case HL_KEYWORD1: return 91;
         case HL_KEYWORD2: return 94;
         case HL_KEYWORD3: return 33;
-        case HL_KEYWORD4: return 33;
+        case HL_KEYWORD4: return 36;
         case HL_STRING: return 32;
         case HL_NUMBER: return 91;
         case HL_MATCH: return 33;
