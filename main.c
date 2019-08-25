@@ -24,6 +24,7 @@
 #define NIM_VERSION "0.0.1"
 #define NIM_QUIT_TIMES 2
 #define NIM_TAB_STOP 4
+#define NIM_NUMLINES true
 
 #define HL_NUMBERS (1 << 0)
 #define HL_STRINGS (1 << 1)
@@ -86,6 +87,7 @@ struct erow {
 struct econfig {
     size_t x;
     size_t y;
+    uint8_t gw;
     size_t rx;
     uint16_t w;
     uint16_t h;
@@ -284,6 +286,22 @@ int8_t get_screen_size(uint16_t *rows, uint16_t *cols) {
     *cols = ws.ws_col;
 
     return 0;
+}
+
+void update_gutter() {
+    uint8_t old_gw = E.gw;
+    E.gw = 0;
+
+    if (NIM_NUMLINES) {
+        char lines[16];
+        E.gw += snprintf(lines, sizeof(lines), "%ld", E.lines);
+    }
+
+    if (E.gw > 0) {
+        E.gw++;
+    }
+
+    E.w -= (E.gw - old_gw);
 }
 
 bool is_separator(uint16_t c) {
@@ -565,6 +583,8 @@ void insert_row(size_t at, char *s, size_t len) {
 
     E.lines++;
     E.dirty = true;
+
+    update_gutter();
 }
 
 void free_row(struct erow *row) {
@@ -587,6 +607,8 @@ void delete_row(size_t at) {
 
     E.lines--;
     E.dirty = true;
+
+    update_gutter();
 }
 
 void insert_char_at_row(struct erow *row, size_t at, uint16_t c) {
@@ -877,6 +899,22 @@ void scroll_screen() {
     }
 }
 
+void draw_gutter(struct abuf *ab, struct erow *row) {
+    if (E.gw == 0) {
+        return;
+    }
+
+    char gutter[E.gw + 1];
+
+    if (row && NIM_NUMLINES) {
+        snprintf(gutter, sizeof(gutter), "%*ld", E.gw - 1, row->idx + 1);
+    }
+
+    ab_append(ab, "\x1b[90m", 5);
+    ab_append(ab, gutter, E.gw);
+    ab_append(ab, "\x1b[39m", 5);
+}
+
 void draw_lines(struct abuf *ab) {
     char welcome[80];
     size_t len = snprintf(welcome, sizeof(welcome), "Nim (%s)", NIM_VERSION);
@@ -886,9 +924,11 @@ void draw_lines(struct abuf *ab) {
     }
 
     for (uint16_t y = 0; y < E.h; y++) {
-        size_t row = y + E.rowoff;
+        size_t idx = y + E.rowoff;
 
-        if (row >= E.lines) {
+        if (idx >= E.lines) {
+            draw_gutter(ab, NULL);
+
             if (E.lines == 0 && y == E.h / 3) {
                 size_t padding = (E.w - len) / 2;
 
@@ -906,7 +946,10 @@ void draw_lines(struct abuf *ab) {
                 ab_append(ab, "~", 1);
             }
         } else {
-            ssize_t len = E.rows[row].rlen - E.coloff;
+            struct erow *row = &E.rows[idx];
+            draw_gutter(ab, row);
+
+            ssize_t len = row->rlen - E.coloff;
 
             if (len < 0) {
                 len = 0;
@@ -914,8 +957,8 @@ void draw_lines(struct abuf *ab) {
                 len = E.w;
             }
 
-            char *c = &E.rows[row].render[E.coloff];
-            uint8_t *hl = &E.rows[row].hl[E.coloff];
+            char *c = &row->render[E.coloff];
+            uint8_t *hl = &row->hl[E.coloff];
             int16_t curr_color = -1;
 
             for (ssize_t i = 0; i < len; i++) {
@@ -971,14 +1014,14 @@ void draw_status_bar(struct abuf *ab) {
     size_t mlen = snprintf(meta, sizeof(meta), "%s | %ld/%ld",
             E.syntax ? E.syntax->filetype : "no ft", E.y + 1, E.lines);
 
-    if (len > E.w) {
-        len = E.w;
+    if (len > E.gw + E.w) {
+        len = E.gw + E.w;
     }
 
     ab_append(ab, status, len);
 
-    while (len < E.w) {
-        if (E.w - len == mlen) {
+    while (len < E.gw + E.w) {
+        if (E.gw + E.w - len == mlen) {
             ab_append(ab, meta, mlen);
             break;
         }
@@ -995,8 +1038,8 @@ void draw_message_bar(struct abuf *ab) {
 
     size_t len = strlen(E.message);
 
-    if (len > E.w) {
-        len = E.w;
+    if (len > E.gw + E.w) {
+        len = E.gw + E.w;
     }
 
     if (len && time(NULL) - E.timestamp < 5) {
@@ -1016,7 +1059,7 @@ void refresh_screen() {
 
     char buf[32];
     size_t num = snprintf(buf, sizeof(buf), "\x1b[%ld;%ldH",
-            (E.y - E.rowoff) + 1, (E.rx - E.coloff) + 1);
+            (E.y - E.rowoff) + 1, (E.rx - E.coloff) + E.gw + 1);
     ab_append(&ab, buf, num);
 
     ab_append(&ab, "\x1b[?25h", 6);
@@ -1224,6 +1267,7 @@ void process_key() {
 void init() {
     E.x = 0;
     E.y = 0;
+    E.gw = 0;
     E.rx = 0;
     E.filename = NULL;
     E.dirty = false;
