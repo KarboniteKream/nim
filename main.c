@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 #define NIM_VERSION "0.0.1"
-#define NIM_QUIT_TIMES 2
+#define NIM_QUIT_TIMES 3
 #define NIM_TAB_STOP 4
 #define NIM_NUMLINES true
 
